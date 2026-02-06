@@ -6,3 +6,10 @@
 //
 
 import Foundation
+
+enum MapMode: String, CaseIterable, Identifiable {
+    case free = "Expression libre"
+    case vote = "Panneaux électoraux"
+
+    var id: String { rawValue }
+}

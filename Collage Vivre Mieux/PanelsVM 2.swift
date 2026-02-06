@@ -6,8 +6,6 @@ import Combine
 final class PanelsVM: ObservableObject {
     @Published var panels: [OpenDataPanel] = []
     @Published var extraPanels: [ExtraPanel] = []
-
-    // ✅ V2: lieux de vote agrégés (1 pin par lieu)
     @Published var votingSites: [VotingSite] = []
 
     @Published var isLoading = false
@@ -18,8 +16,6 @@ final class PanelsVM: ObservableObject {
 
     private let openData = OpenDataClient()
     private let server = LightServerClient()
-
-    // ✅ V2 client
     private let votingOpenData = VotingOpenDataClient()
 
     // MARK: - Loading
@@ -43,17 +39,14 @@ final class PanelsVM: ObservableObject {
         }
     }
 
-    // ✅ V2: charge + agrège en sites (1 pin par lieu)
     func loadVotingSites() async {
         do {
-            let rows = try await votingOpenData.fetchAllRows(limit: 5000)
-            votingSites = votingOpenData.buildSites(from: rows)
+            votingSites = try await votingOpenData.fetchVotingSites(pageSize: 100)
         } catch {
             self.error = "Lieux de vote: \(error.localizedDescription)"
         }
     }
 
-    // ✅ Option B : titre/subtitle modifiables
     func addExtraPanel(lat: Double, lon: Double, title: String, subtitle: String?, createdBy: String) async {
         do {
             try await server.postExtraPanel(
@@ -69,7 +62,7 @@ final class PanelsVM: ObservableObject {
         }
     }
 
-    // MARK: - Actions (cover / absent)
+    // MARK: - Actions (covered / absent / overposted / todo)
 
     func markCovered(
         panelId: String,
@@ -81,15 +74,24 @@ final class PanelsVM: ObservableObject {
     ) async {
         let status = upsertStatus(panelId: panelId, modelContext: modelContext)
 
+        // reset absent
         status.isAbsent = false
         status.absentAt = nil
         status.absentBy = nil
         status.absentReason = nil
 
+        // reset overposted
+        status.isOverposted = false
+        status.overpostedAt = nil
+        status.overpostedBy = nil
+        status.overpostedNote = nil
+
+        // set covered
         status.lastCoveredAt = coveredAt
         status.lastCoveredBy = coveredBy
         status.note = note
         status.photoFilename = photoFilename
+
         status.needsSync = true
 
         let event = CoverEvent(
@@ -121,15 +123,23 @@ final class PanelsVM: ObservableObject {
     ) async {
         let status = upsertStatus(panelId: panelId, modelContext: modelContext)
 
+        // set absent
         status.isAbsent = true
         status.absentAt = reportedAt
         status.absentBy = reportedBy
         status.absentReason = reason
 
+        // reset covered
         status.lastCoveredAt = nil
         status.lastCoveredBy = nil
         status.note = nil
         status.photoFilename = nil
+
+        // reset overposted
+        status.isOverposted = false
+        status.overpostedAt = nil
+        status.overpostedBy = nil
+        status.overpostedNote = nil
 
         status.needsSync = true
 
@@ -153,73 +163,262 @@ final class PanelsVM: ObservableObject {
         }
     }
 
+    // ✅ NEW: recouvert adversaires
+    func markOverposted(
+        panelId: String,
+        at: Date,
+        by: String,
+        note: String?,
+        modelContext: ModelContext
+    ) async {
+        let status = upsertStatus(panelId: panelId, modelContext: modelContext)
+
+        // reset absent
+        status.isAbsent = false
+        status.absentAt = nil
+        status.absentBy = nil
+        status.absentReason = nil
+
+        // reset covered (optionnel, mais logique: s’il est recouvert par adversaires => plus “à jour”)
+        status.lastCoveredAt = nil
+        status.lastCoveredBy = nil
+        status.note = nil
+        status.photoFilename = nil
+
+        // set overposted
+        status.isOverposted = true
+        status.overpostedAt = at
+        status.overpostedBy = by
+        status.overpostedNote = note
+
+        status.needsSync = true
+
+        let event = CoverEvent(
+            id: UUID().uuidString,
+            panelId: panelId,
+            coveredAt: at,
+            coveredBy: by,
+            note: note,
+            photoFilename: nil,
+            eventType: "overposted",
+            absentReason: nil
+        )
+
+        do {
+            try await server.postCoverEvent(event)
+            status.needsSync = false
+            status.lastSyncedAt = .now
+        } catch {
+            self.error = "Sync adversaires: \(error.localizedDescription)"
+        }
+    }
+
+    // ✅ NEW: marquer à faire (reset)
+    func markTodo(
+        panelId: String,
+        at: Date,
+        by: String,
+        modelContext: ModelContext
+    ) async {
+        let status = upsertStatus(panelId: panelId, modelContext: modelContext)
+
+        // reset all
+        status.isAbsent = false
+        status.absentAt = nil
+        status.absentBy = nil
+        status.absentReason = nil
+
+        status.isOverposted = false
+        status.overpostedAt = nil
+        status.overpostedBy = nil
+        status.overpostedNote = nil
+
+        status.lastCoveredAt = nil
+        status.lastCoveredBy = nil
+        status.note = nil
+        status.photoFilename = nil
+
+        status.needsSync = true
+
+        let event = CoverEvent(
+            id: UUID().uuidString,
+            panelId: panelId,
+            coveredAt: at,
+            coveredBy: by,
+            note: nil,
+            photoFilename: nil,
+            eventType: "todo",
+            absentReason: nil
+        )
+
+        do {
+            try await server.postCoverEvent(event)
+            status.needsSync = false
+            status.lastSyncedAt = .now
+        } catch {
+            self.error = "Sync à faire: \(error.localizedDescription)"
+        }
+    }
+
+    // MARK: - Coordination (Responsabilité)
+
+        /// Alterne la responsabilité de l'utilisateur sur un panneau et synchronise avec Supabase
+        func toggleResponsibility(panelId: String, userName: String, modelContext: ModelContext) {
+            // 1. Mise à jour locale dans SwiftData
+            let status = upsertStatus(panelId: panelId, modelContext: modelContext)
+            
+            if status.assignedTo == userName {
+                // Si c'est déjà l'utilisateur, on libère le panneau localement
+                status.assignedTo = nil
+                status.assignedAt = nil
+                print("Responsabilité retirée localement pour le panneau: \(panelId)")
+            } else {
+                // Sinon, on assigne l'utilisateur comme responsable localement
+                status.assignedTo = userName
+                status.assignedAt = Date()
+                print("Utilisateur \(userName) désormais responsable localement du panneau: \(panelId)")
+            }
+            
+            // 2. Synchronisation asynchrone avec le serveur Supabase
+            Task {
+                do {
+                    // On appelle la nouvelle méthode updateAssignment de LightServerClient
+                    try await server.updateAssignment(
+                        panelId: panelId,
+                        user: status.assignedTo,
+                        date: status.assignedAt
+                    )
+                    print("✅ Synchronisation de la responsabilité réussie sur Supabase")
+                } catch {
+                    print("❌ Erreur de synchronisation coordination : \(error.localizedDescription)")
+                    // Optionnel : vous pourriez ici marquer status.needsSync = true
+                    // si vous voulez retenter plus tard
+                }
+            }
+        }
     // MARK: - Sync
 
-    func syncFromServer(modelContext: ModelContext) async {
-        do {
-            let events = try await server.fetchLatestEvents(limit: 5000)
-            let serverPanelIds = Set(events.map { $0.panel_id })
-
-            for ev in events {
-                let s = upsertStatus(panelId: ev.panel_id, modelContext: modelContext)
-                if s.needsSync { continue }
-
-                let type = (ev.event_type ?? "covered").lowercased()
-
-                if type == "absent" {
-                    s.isAbsent = true
-                    s.absentAt = ev.covered_at
-                    s.absentBy = ev.covered_by
-                    s.absentReason = ev.absent_reason
-
-                    s.lastCoveredAt = nil
-                    s.lastCoveredBy = nil
-                    s.note = nil
-                    s.photoFilename = nil
-                } else {
-                    s.isAbsent = false
-                    s.absentAt = nil
-                    s.absentBy = nil
-                    s.absentReason = nil
-
-                    s.lastCoveredAt = ev.covered_at
-                    s.lastCoveredBy = ev.covered_by
-                    s.note = ev.note
-                    s.photoFilename = ev.photo_filename
-                }
-
-                s.needsSync = false
-                s.lastSyncedAt = .now
-            }
-
-            // Reconcile deletions
+        func syncFromServer(modelContext: ModelContext) async {
             do {
-                let locals = try modelContext.fetch(FetchDescriptor<PanelLocalStatus>())
-                for s in locals {
+                let events = try await server.fetchLatestEvents(limit: 5000)
+                let serverPanelIds = Set(events.map { $0.panel_id })
+
+                for ev in events {
+                    let s = upsertStatus(panelId: ev.panel_id, modelContext: modelContext)
                     if s.needsSync { continue }
-                    if !serverPanelIds.contains(s.panelId) {
-                        s.isAbsent = false
-                        s.absentAt = nil
-                        s.absentBy = nil
-                        s.absentReason = nil
+
+                    let type = (ev.event_type ?? "covered").lowercased()
+
+                    if type == "absent" {
+                        s.isAbsent = true
+                        s.absentAt = ev.covered_at
+                        s.absentBy = ev.covered_by
+                        s.absentReason = ev.absent_reason
+
+                        s.isOverposted = false
+                        s.overpostedAt = nil
+                        s.overpostedBy = nil
+                        s.overpostedNote = nil
 
                         s.lastCoveredAt = nil
                         s.lastCoveredBy = nil
                         s.note = nil
                         s.photoFilename = nil
 
-                        s.lastSyncedAt = .now
+                    } else if type == "overposted" {
+                        s.isAbsent = false
+                        s.absentAt = nil
+                        s.absentBy = nil
+                        s.absentReason = nil
+
+                        s.isOverposted = true
+                        s.overpostedAt = ev.covered_at
+                        s.overpostedBy = ev.covered_by
+                        s.overpostedNote = ev.note
+
+                        s.lastCoveredAt = nil
+                        s.lastCoveredBy = nil
+                        s.note = nil
+                        s.photoFilename = nil
+
+                    } else if type == "todo" {
+                        s.isAbsent = false
+                        s.absentAt = nil
+                        s.absentBy = nil
+                        s.absentReason = nil
+
+                        s.isOverposted = false
+                        s.overpostedAt = nil
+                        s.overpostedBy = nil
+                        s.overpostedNote = nil
+
+                        s.lastCoveredAt = nil
+                        s.lastCoveredBy = nil
+                        s.note = nil
+                        s.photoFilename = nil
+
+                    } else {
+                        // covered
+                        s.isAbsent = false
+                        s.absentAt = nil
+                        s.absentBy = nil
+                        s.absentReason = nil
+
+                        s.isOverposted = false
+                        s.overpostedAt = nil
+                        s.overpostedBy = nil
+                        s.overpostedNote = nil
+
+                        s.lastCoveredAt = ev.covered_at
+                        s.lastCoveredBy = ev.covered_by
+                        s.note = ev.note
+                        s.photoFilename = ev.photo_filename
                     }
+                    
+                    // ✅ Mise à jour de la responsabilité depuis le serveur
+                    s.assignedTo = ev.assigned_to
+                    s.assignedAt = ev.assigned_at
+                    
+                    s.needsSync = false
+                    s.lastSyncedAt = .now
                 }
+
+                // Reconcile deletions
+                do {
+                    let locals = try modelContext.fetch(FetchDescriptor<PanelLocalStatus>())
+                    for s in locals {
+                        if s.needsSync { continue }
+                        if !serverPanelIds.contains(s.panelId) {
+                            s.isAbsent = false
+                            s.absentAt = nil
+                            s.absentBy = nil
+                            s.absentReason = nil
+
+                            s.isOverposted = false
+                            s.overpostedAt = nil
+                            s.overpostedBy = nil
+                            s.overpostedNote = nil
+
+                            s.lastCoveredAt = nil
+                            s.lastCoveredBy = nil
+                            s.note = nil
+                            s.photoFilename = nil
+
+                            // ✅ On remet aussi à zéro le responsable si le panneau disparaît du serveur
+                            s.assignedTo = nil
+                            s.assignedAt = nil
+
+                            s.lastSyncedAt = .now
+                        }
+                    }
+                } catch {
+                    self.error = "Reconcile local: \(error.localizedDescription)"
+                }
+
             } catch {
-                self.error = "Reconcile local: \(error.localizedDescription)"
+                self.error = "Lecture serveur : \(error.localizedDescription)"
             }
-
-        } catch {
-            self.error = "Lecture serveur : \(error.localizedDescription)"
         }
-    }
-
     // MARK: - Activity / Dashboard
 
     func loadRecentActivity() async {
