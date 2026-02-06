@@ -279,20 +279,28 @@ final class PanelsVM: ObservableObject {
                 print("Utilisateur \(userName) désormais responsable localement du panneau: \(panelId)")
             }
             
-            // 2. Synchronisation asynchrone avec le serveur Supabase
+            // 2. PROTECTION : On met à jour la date de synchro locale à "maintenant"
+            // Cela empêche la fonction 'syncFromServer' d'écraser ce panneau
+            // avec d'anciennes données pendant que la requête réseau est en cours.
+            status.lastSyncedAt = .now
+            
+            // 3. Synchronisation asynchrone avec le serveur Supabase
             Task {
                 do {
-                    // On appelle la nouvelle méthode updateAssignment de LightServerClient
+                    // Appel de la méthode qui utilise NSNull() pour le retrait
                     try await server.updateAssignment(
                         panelId: panelId,
                         user: status.assignedTo,
                         date: status.assignedAt
                     )
                     print("✅ Synchronisation de la responsabilité réussie sur Supabase")
+                    
+                    // On confirme la synchro après le succès serveur
+                    status.lastSyncedAt = .now
                 } catch {
                     print("❌ Erreur de synchronisation coordination : \(error.localizedDescription)")
-                    // Optionnel : vous pourriez ici marquer status.needsSync = true
-                    // si vous voulez retenter plus tard
+                    // En cas d'échec, on marque qu'il faudra resynchroniser
+                    status.needsSync = true
                 }
             }
         }

@@ -38,31 +38,55 @@ final class LightServerClient {
 
     // MARK: - Coordination (Responsabilité)
 
-    /// Met à jour la responsabilité d'un panneau sur la table dédiée
-    func updateAssignment(panelId: String, user: String?, date: Date?) async throws {
-        let url = supabaseURL.appendingPathComponent("rest/v1/panel_assignments")
-        var req = makeRequest(url: url, method: "POST")
-        
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        // Utilise l'UPSERT pour mettre à jour la ligne existante si le panel_id existe déjà
-        req.setValue("return=minimal, resolution=merge-duplicates", forHTTPHeaderField: "Prefer")
+        /// Met à jour la responsabilité d'un panneau sur la table dédiée
+        func updateAssignment(panelId: String, user: String?, date: Date?) async throws {
+            // On cible la ligne précise du panneau via son ID
+            let url = supabaseURL.appendingPathComponent("rest/v1/panel_assignments")
+            
+            // On utilise POST avec l'en-tête UPSERT (plus robuste pour la création/mise à jour)
+            var req = makeRequest(url: url, method: "POST")
+            
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            // "resolution=merge-duplicates" permet de mettre à jour si le panel_id existe déjà
+            req.setValue("return=minimal, resolution=merge-duplicates", forHTTPHeaderField: "Prefer")
 
-        struct AssignmentBody: Codable {
-            let panel_id: String
-            let assigned_to: String?
-            let assigned_at: Date?
+            // Structure locale
+            struct AssignmentBody: Codable {
+                let panel_id: String
+                let assigned_to: String?
+                let assigned_at: Date?
+            }
+
+            let body = AssignmentBody(
+                panel_id: panelId,
+                assigned_to: user, // Si c'est nil, on veut que Supabase reçoive "null"
+                assigned_at: date
+            )
+
+            // Force l'encodage des valeurs optionnelles à null
+            // Note: L'encodeur JSON de base omet parfois les clés nil.
+            // Si le problème persiste, on passe par un dictionnaire.
+            let jsonData: Data
+            if user == nil {
+                // Pour le retrait, on envoie un dictionnaire explicite pour forcer le null
+                let dict: [String: Any?] = [
+                    "panel_id": panelId,
+                    "assigned_to": NSNull(),
+                    "assigned_at": NSNull()
+                ]
+                // On utilise JSONSerialization car JSONEncoder peut sauter les clés nil
+                jsonData = try JSONSerialization.data(withJSONObject: dict)
+            } else {
+                jsonData = try encoder.encode(body)
+            }
+
+            req.httpBody = jsonData
+            
+            let (data, resp) = try await session.data(for: req)
+            try validate(data, resp)
+            
+            print("📡 Supabase : Mise à jour responsable \(user ?? "Retrait") pour \(panelId)")
         }
-
-        let body = AssignmentBody(
-            panel_id: panelId,
-            assigned_to: user,
-            assigned_at: date
-        )
-
-        req.httpBody = try encoder.encode(body)
-        let (data, resp) = try await session.data(for: req)
-        try validate(data, resp)
-    }
 
     // MARK: - Cover events
 

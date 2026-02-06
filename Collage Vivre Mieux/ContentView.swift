@@ -169,14 +169,19 @@ struct ContentView: View {
                         // ✅ GESTE SPATIAL : Capture de la position lors de l'appui long
                         .simultaneousGesture(
                             LongPressGesture(minimumDuration: 1.0)
-                                .sequenced(before: DragGesture(minimumDistance: 0))
+                                .sequenced(before: DragGesture(minimumDistance: 0, coordinateSpace: .global)) // 1. On utilise le référentiel global
                                 .onEnded { value in
                                     switch value {
                                     case .second(true, let drag):
                                         if let location = drag?.location {
+                                            // 2. On convertit depuis le référentiel global vers la carte
                                             guard mapMode == .free,
-                                                  let coord = proxy.convert(location, from: .local)
+                                                  let coord = proxy.convert(location, from: .global)
                                             else { return }
+
+                                            // 3. Retour haptique pour confirmer l'appui précis
+                                            let generator = UIImpactFeedbackGenerator(style: .medium)
+                                            generator.impactOccurred()
 
                                             collapseDrawer()
                                             addExtraLocation = CLLocation(
